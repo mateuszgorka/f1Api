@@ -1,8 +1,10 @@
-flask==3.0.0
-flask-cors==4.0.0
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic-settings
 fastf1==3.6.0
 openai>=1.50.0
 python-dotenv==1.0.0
 pandas>=2.2.0
 numpy>=1.26.0
-requests==2.31.0 
+requests==2.31.0
+python-multipart==0.0.6 
