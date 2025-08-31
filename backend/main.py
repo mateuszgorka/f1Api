@@ -15,7 +15,11 @@ import pandas as pd
 import numpy as np
 
 # Load environment variables
-load_dotenv()
+try:
+    load_dotenv()
+except Exception as e:
+    print(f"Warning: Could not load .env file: {e}")
+    print("Continuing with default settings...")
 
 class Settings(BaseSettings):
     openai_api_key: str = ""
@@ -26,13 +30,20 @@ class Settings(BaseSettings):
     cache_dir: str = "cache"
     
     class Config:
-        env_file = ".env"
+        env_file = None  # Don't load .env file by default
 
 settings = Settings()
 
-# Enable FastF1 cache
-if settings.cache_enabled:
-    fastf1.Cache.enable_cache(settings.cache_dir)
+# Enable FastF1 cache (disabled in Docker to avoid permission issues)
+if settings.cache_enabled and not os.path.exists('/.dockerenv'):
+    try:
+        fastf1.Cache.enable_cache(settings.cache_dir)
+        print(f"FastF1 cache enabled: {settings.cache_dir}")
+    except Exception as e:
+        print(f"Warning: Could not enable FastF1 cache: {e}")
+        print("Continuing without cache...")
+else:
+    print("FastF1 cache disabled (running in Docker or cache disabled)")
 
 # Initialize OpenAI client
 if not settings.openai_api_key or settings.openai_api_key == "your_openai_api_key_here":
@@ -170,31 +181,46 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 def get_race_schedule(year: int = None) -> List[RaceInfo]:
-    """Get F1 race schedule for a year"""
+    """Get F1 race schedule for a year using Ergast API"""
     if year is None:
         year = datetime.now().year
     
     try:
-        schedule = fastf1.get_event_schedule(year)
-        if schedule.empty:
+        print(f"Fetching race schedule for year: {year}")
+        from fastf1.ergast import Ergast
+        ergast = Ergast()
+        schedule = ergast.get_race_schedule(year)
+        
+        print(f"Schedule data received: {len(schedule) if schedule is not None else 0} races found")
+        
+        if schedule is None or len(schedule) == 0:
+            print(f"No races found for year {year}")
             return []
         
         races = []
         for _, race in schedule.iterrows():
-            if race['EventFormat'] == 'conventional':
-                races.append(RaceInfo(
+            try:
+                # Parse race data from Ergast DataFrame format
+                race_info = RaceInfo(
                     year=year,
-                    round=int(race['RoundNumber']),
-                    name=race['EventName'],
-                    circuit=race['CircuitShortName'],
-                    country=race['Country'],
-                    startDate=race['EventDate'].strftime('%Y-%m-%d') if pd.notna(race['EventDate']) else '',
-                    endDate=race['EventDate'].strftime('%Y-%m-%d') if pd.notna(race['EventDate']) else ''
-                ))
+                    round=int(race['round']),
+                    name=race['raceName'],
+                    circuit=race['circuitName'],
+                    country=race['country'],
+                    startDate=race['raceDate'].strftime('%Y-%m-%d') if pd.notna(race['raceDate']) else '',
+                    endDate=race['raceDate'].strftime('%Y-%m-%d') if pd.notna(race['raceDate']) else ''
+                )
+                races.append(race_info)
+                print(f"Added race: {race_info.name} ({race_info.country}) - Round {race_info.round}")
+            except Exception as e:
+                print(f"Error parsing race data: {e}")
+                continue
         
+        print(f"Successfully parsed {len(races)} races")
         return races
+        
     except Exception as e:
-        print(f"Error getting race schedule: {e}")
+        print(f"Error getting race schedule from Ergast: {e}")
         return []
 
 def get_latest_race() -> RaceInfo:
@@ -231,14 +257,59 @@ def get_latest_race() -> RaceInfo:
 
 @app.get("/races", response_model=List[RaceInfo])
 async def get_races():
-    """Get all races for current year"""
+    """Get last 3 races for current year"""
+    print("=== RACES ENDPOINT CALLED ===")
     try:
         current_year = datetime.now().year
+        print(f"Getting races for year: {current_year}")
+        
         races = get_race_schedule(current_year)
-        return races
+        
+        if not races:
+            print("No races found - returning error response")
+            return JSONResponse(
+                status_code=404,
+                content={"error": "No races found for this season"}
+            )
+        
+        # Sort races by date and get the last 3
+        try:
+            print(f"Total races found: {len(races)}")
+            
+            # Convert date strings to datetime objects for sorting
+            for race in races:
+                if race.startDate:
+                    race._sort_date = datetime.strptime(race.startDate, '%Y-%m-%d')
+                    print(f"Race: {race.name} - Date: {race.startDate} - Sort date: {race._sort_date}")
+                else:
+                    race._sort_date = datetime.min
+                    print(f"Race: {race.name} - No date - Sort date: {race._sort_date}")
+            
+            # Sort by date (most recent first)
+            races.sort(key=lambda x: x._sort_date, reverse=True)
+            
+            # Get only the last 3 races
+            last_3_races = races[:3]
+            
+            # Remove the temporary sort date attribute
+            for race in last_3_races:
+                if hasattr(race, '_sort_date'):
+                    delattr(race, '_sort_date')
+            
+            print(f"Returning last 3 races: {[f'{r.name} ({r.country})' for r in last_3_races]}")
+            return last_3_races
+            
+        except Exception as sort_error:
+            print(f"Error sorting races by date: {sort_error}")
+            # Fallback: return first 3 races if sorting fails
+            return races[:3]
+            
     except Exception as e:
         print(f"Error getting races: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch races: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to fetch races: {str(e)}"}
+        )
 
 @app.get("/races/{round}/sessions", response_model=List[SessionInfo])
 async def get_race_sessions(round: int):
